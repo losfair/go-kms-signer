@@ -4,7 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/davecgh/go-spew/spew"
+	"log"
+
 	"github.com/glassechidna/go-kms-signer/kmssigner"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -51,7 +52,7 @@ func (k *kmsagent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) 
 		}
 
 		signature, err := sshsign.Sign(nil, data)
-		spew.Dump(signature, err)
+		log.Printf("Signed data of length %d.\n", len(data))
 		return signature, err
 	}
 
@@ -111,13 +112,14 @@ func (k *kmsagent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Sig
 			algorithm = ssh.SigAlgoRSASHA2256
 		case agent.SignatureFlagRsaSha512:
 			algorithm = ssh.SigAlgoRSASHA2512
+		case 0:
 		default:
 			return nil, fmt.Errorf("agent: unsupported signature flags: %d", flags)
 		}
 
 		if algoSigner, ok := sshsign.(ssh.AlgorithmSigner); ok {
 			signature, err := algoSigner.SignWithAlgorithm(nil, data, algorithm)
-			spew.Dump(signature, err)
+			log.Printf("Signed data of length %d.\n", len(data))
 			return signature, err
 		}
 	}

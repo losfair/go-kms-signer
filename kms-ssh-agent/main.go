@@ -1,60 +1,135 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
-	"github.com/aws/aws-sdk-go/aws"
+	"io"
+	"log"
+	"net"
+	"os"
+	"os/exec"
+	"path"
+	"strings"
+	"syscall"
+
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/kms"
 	"github.com/aws/aws-sdk-go/service/kms/kmsiface"
 	"github.com/glassechidna/go-kms-signer/kms-ssh-agent/kmsagent"
-	"github.com/glassechidna/go-kms-signer/kms-ssh-agent/socket"
 	"github.com/glassechidna/go-kms-signer/kmssigner"
-	"github.com/pkg/errors"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
-	"io"
-	"io/ioutil"
-	"log"
-	"os"
-	"os/user"
-	"path/filepath"
-	"text/template"
 )
 
 func main() {
-	if len(os.Args) != 2 {
-		exe, _ := os.Executable()
-		fmt.Fprintf(os.Stderr, "usage: %s install|agent\n", exe)
-		os.Exit(1)
+	keyId := os.Getenv("KMS_KEY_ID")
+	if keyId == "" {
+		log.Fatalln("KMS_KEY_ID environment variable not set")
 	}
 
 	sess := session.Must(session.NewSession())
 	api := kms.New(sess)
 
-	if os.Args[1] == "install" {
-		err := install(api)
-		if err != nil {
-			log.Fatalf("%+v\n", err)
+	pubresp, err := api.GetPublicKey(&kms.GetPublicKeyInput{KeyId: &keyId})
+	if err != nil {
+		log.Fatalf("GetPublicKey error: %+v\n", err)
+	}
+
+	key, err := kmssigner.ParseCryptoKey(pubresp)
+	if err != nil {
+		log.Fatalf("ParseCryptoKey error: %+v\n", err)
+	}
+
+	sshkey, err := ssh.NewPublicKey(key)
+	if err != nil {
+		log.Fatalf("NewPublicKey error: %+v\n", err)
+	}
+
+	authorized := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshkey))) + " kms-" + keyId
+	log.Printf("SSH public key: \n%s\n", string(authorized))
+
+	keyType := sshkey.Type()
+	var signMode kmssigner.Mode
+	if keyType == "ssh-rsa" {
+		signMode = kmssigner.ModeRsaPkcs1v15
+	} else if strings.HasPrefix(keyType, "ecdsa-sha2-") {
+		signMode = kmssigner.ModeEcdsa
+	} else {
+		log.Fatalf("unsupported key type: %s\n", keyType)
+	}
+
+	listenSock := os.Getenv("AGENT_LISTEN_SOCK")
+
+	args := os.Args
+	if len(args) > 1 {
+		if listenSock != "" {
+			panic("cannot specify both AGENT_LISTEN_SOCK and arguments")
 		}
-	} else if os.Args[1] == "agent" {
-		keyId := os.Getenv("KeyId")
-		err := serve(api, keyId)
+
+		listenSockDir, err := os.MkdirTemp("", "kms-ssh-agent-")
 		if err != nil {
-			log.Fatalf("%+v\n", err)
+			panic(err)
+		}
+		listenSock = path.Join(listenSockDir, "service.sock")
+		defer os.RemoveAll(listenSockDir)
+
+		lis, err := net.Listen("unix", listenSock)
+		if err != nil {
+			panic(err)
+		}
+		os.Setenv("SSH_AUTH_SOCK", listenSock)
+		cmd := exec.Command(args[1], args[2:]...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		cmd.SysProcAttr = &syscall.SysProcAttr{Foreground: true, Setpgid: true, Pdeathsig: syscall.SIGHUP}
+		err = cmd.Start()
+		if err != nil {
+			// Use panic to ensure that `defer` is run
+			panic(fmt.Sprintf("unable to start command: %+v\n", err))
+		}
+
+		go func() {
+			defer func() {
+				if err := recover(); err != nil {
+					log.Printf("error in service thread: %+v\n", err)
+				}
+				os.RemoveAll(listenSockDir)
+				os.Exit(0)
+			}()
+			serve(lis, api, signMode, keyId)
+		}()
+
+		err = cmd.Wait()
+		if err != nil {
+			switch e := err.(type) {
+			case *exec.ExitError:
+				// defer will no longer run
+				os.RemoveAll(listenSockDir)
+				os.Exit(e.ExitCode())
+			default:
+				panic(fmt.Sprintf("wait command failed: %+v\n", err))
+			}
 		}
 	} else {
-		panic("Unrecognised command")
+		if listenSock == "" {
+			log.Println("Exiting because the AGENT_LISTEN_SOCK environment variable is not set.")
+			os.Exit(0)
+		}
+
+		os.Remove(listenSock)
+		lis, err := net.Listen("unix", listenSock)
+		if err != nil {
+			panic(err)
+		}
+		err = serve(lis, api, signMode, keyId)
+		if err != nil {
+			panic(err)
+		}
 	}
 }
 
-func serve(api kmsiface.KMSAPI, keyId string) error {
-	signer := kmssigner.New(api, keyId, kmssigner.ModeRsaPkcs1v15)
-
-	lis, err := socket.Listener("agentSocket")
-	if err != nil {
-		panic(err)
-	}
+func serve(lis net.Listener, api kmsiface.KMSAPI, mode kmssigner.Mode, keyId string) error {
+	signer := kmssigner.New(api, keyId, mode)
 
 	kmsag, err := kmsagent.New([]*kmssigner.Signer{signer})
 	if err != nil {
@@ -72,142 +147,4 @@ func serve(api kmsiface.KMSAPI, keyId string) error {
 			panic(err)
 		}
 	}
-}
-
-func install(api kmsiface.KMSAPI) error {
-	u, err := user.Current()
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	create, err := api.CreateKey(&kms.CreateKeyInput{
-		CustomerMasterKeySpec: aws.String(kms.CustomerMasterKeySpecRsa2048),
-		Description:           aws.String(fmt.Sprintf("kms-ssh-agent for %s", u.Username)),
-		KeyUsage:              aws.String(kms.KeyUsageTypeSignVerify),
-		Tags: []*kms.Tag{
-			{
-				TagKey:   aws.String("created-by"),
-				TagValue: aws.String("kms-ssh-agent"),
-			},
-		},
-	})
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	keyArn := *create.KeyMetadata.Arn
-	fmt.Println(keyArn)
-	fmt.Printf("* Created KMS key with ARN: %s\n", keyArn)
-
-	plistTemplate, err := template.New("").Parse(`
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-    <dict>
-        <key>Label</key>
-        <string>com.glassechidna.kms-ssh-agent</string>
-        <key>ProgramArguments</key>
-        <array>
-            <string>{{ .ExePath }}</string>
-            <string>agent</string>
-        </array>
-        <key>EnvironmentVariables</key>
-        <dict>
-            <key>KeyId</key>
-            <string>{{ .KeyId }}</string>
-        </dict>
-        <key>Sockets</key>
-        <dict>
-            <key>agentSocket</key>
-            <dict>
-                <key>SockFamily</key>
-                <string>Unix</string>
-                <key>SockPathMode</key>
-                <integer>448</integer>
-                <key>SockPathName</key>
-                <string>{{ .SocketPath }}</string>
-                <key>SockType</key>
-                <string>Stream</string>
-            </dict>
-        </dict>
-    </dict>
-</plist>
-`[1:])
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	buf := &bytes.Buffer{}
-	socketPath := filepath.Join(u.HomeDir, ".ssh", "kms-ssh-agent.sock")
-	exePath, err := os.Executable()
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	err = plistTemplate.Execute(buf, map[string]string{
-		"SocketPath": socketPath,
-		"ExePath":    exePath,
-		"KeyId":      keyArn,
-	})
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	plistPath := filepath.Join(u.HomeDir, "Library", "LaunchAgents", "com.glassechidna.kms-ssh-agent.plist")
-	err = ioutil.WriteFile(plistPath, buf.Bytes(), 0644)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	fmt.Printf("* Wrote launch agent plist to %s\n", plistPath)
-
-	sshConfigPath := filepath.Join(u.HomeDir, ".ssh", "config")
-	sshConfig, err := os.OpenFile(sshConfigPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	_, err = sshConfig.WriteString(fmt.Sprintf(`
-Host *
-  IdentityAgent %s
-`, socketPath))
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	err = sshConfig.Close()
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	fmt.Printf("* Added IdentityAgent config to %s\n", sshConfigPath)
-
-	pubresp, err := api.GetPublicKey(&kms.GetPublicKeyInput{KeyId: &keyArn})
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	key, err := kmssigner.ParseCryptoKey(pubresp)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	sshkey, err := ssh.NewPublicKey(key)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	authorized := ssh.MarshalAuthorizedKey(sshkey)
-	fmt.Printf("* Now you can add the following SSH public key to .ssh/authorized_keys on hosts you want to SSH into:\n\n%s", authorized)
-
-	fmt.Printf(`
-If you want to uninstall, follow these steps:
-
-  * Delete %s
-  * Delete %s
-  * Remove the IdentityAgent at the bottom of %s
-  * Delete the KMS key with ARN %s
-`, exePath, socketPath, sshConfigPath, keyArn)
-
-	return nil
 }
