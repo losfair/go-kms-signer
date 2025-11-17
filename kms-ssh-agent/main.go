@@ -1,15 +1,11 @@
 package main
 
 import (
-	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
-	"os/exec"
-	"path"
 	"strings"
-	"syscall"
 
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/kms"
@@ -59,72 +55,19 @@ func main() {
 
 	listenSock := os.Getenv("AGENT_LISTEN_SOCK")
 
-	args := os.Args
-	if len(args) > 1 {
-		if listenSock != "" {
-			panic("cannot specify both AGENT_LISTEN_SOCK and arguments")
-		}
+	if listenSock == "" {
+		log.Println("Exiting because the AGENT_LISTEN_SOCK environment variable is not set.")
+		os.Exit(0)
+	}
 
-		listenSockDir, err := os.MkdirTemp("", "kms-ssh-agent-")
-		if err != nil {
-			panic(err)
-		}
-		listenSock = path.Join(listenSockDir, "service.sock")
-		defer os.RemoveAll(listenSockDir)
-
-		lis, err := net.Listen("unix", listenSock)
-		if err != nil {
-			panic(err)
-		}
-		os.Setenv("SSH_AUTH_SOCK", listenSock)
-		cmd := exec.Command(args[1], args[2:]...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		cmd.Stdin = os.Stdin
-		cmd.SysProcAttr = &syscall.SysProcAttr{Foreground: true, Setpgid: true, Pdeathsig: syscall.SIGHUP}
-		err = cmd.Start()
-		if err != nil {
-			// Use panic to ensure that `defer` is run
-			panic(fmt.Sprintf("unable to start command: %+v\n", err))
-		}
-
-		go func() {
-			defer func() {
-				if err := recover(); err != nil {
-					log.Printf("error in service thread: %+v\n", err)
-				}
-				os.RemoveAll(listenSockDir)
-				os.Exit(0)
-			}()
-			serve(lis, api, signMode, keyId)
-		}()
-
-		err = cmd.Wait()
-		if err != nil {
-			switch e := err.(type) {
-			case *exec.ExitError:
-				// defer will no longer run
-				os.RemoveAll(listenSockDir)
-				os.Exit(e.ExitCode())
-			default:
-				panic(fmt.Sprintf("wait command failed: %+v\n", err))
-			}
-		}
-	} else {
-		if listenSock == "" {
-			log.Println("Exiting because the AGENT_LISTEN_SOCK environment variable is not set.")
-			os.Exit(0)
-		}
-
-		os.Remove(listenSock)
-		lis, err := net.Listen("unix", listenSock)
-		if err != nil {
-			panic(err)
-		}
-		err = serve(lis, api, signMode, keyId)
-		if err != nil {
-			panic(err)
-		}
+	os.Remove(listenSock)
+	lis, err := net.Listen("unix", listenSock)
+	if err != nil {
+		panic(err)
+	}
+	err = serve(lis, api, signMode, keyId)
+	if err != nil {
+		panic(err)
 	}
 }
 

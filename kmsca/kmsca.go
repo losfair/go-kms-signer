@@ -198,4 +198,3 @@ func makeRootCA() {
 	}
 	fmt.Printf("Wrote root CA certificate to %s\n", rootPemPath)
 }
-
